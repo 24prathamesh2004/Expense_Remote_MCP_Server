@@ -1,10 +1,19 @@
-"""Supabase client helpers."""
+"""Supabase client helpers with per-request token context."""
 
 from __future__ import annotations
 
 import os
+from contextvars import ContextVar
 
 from supabase import Client, create_client
+
+# Per-request JWT — set by the API-key middleware on each incoming request
+_request_token: ContextVar[str] = ContextVar("request_token", default="")
+
+
+def set_request_token(token: str) -> None:
+    """Inject the user JWT for the current async context (called by middleware)."""
+    _request_token.set(token)
 
 
 def _url_and_key() -> tuple[str, str]:
@@ -16,11 +25,15 @@ def _url_and_key() -> tuple[str, str]:
 
 
 def require_access_token() -> str:
-    """Return the current user's JWT.
+    """Return the JWT for the current request.
 
-    Production: token is injected per-request via API-key middleware.
-    Local dev: falls back to SUPABASE_ACCESS_TOKEN env var.
+    Priority:
+      1. Per-request context (set by API-key middleware — production)
+      2. SUPABASE_ACCESS_TOKEN env var (local dev only)
     """
+    token = _request_token.get()
+    if token:
+        return token
     token = os.environ.get("SUPABASE_ACCESS_TOKEN", "").strip()
     if not token:
         raise RuntimeError(
@@ -40,6 +53,6 @@ def get_user_client() -> Client:
 
 
 def get_anon_client() -> Client:
-    """Unauthenticated Supabase client (used only for registration / login RPCs)."""
+    """Unauthenticated Supabase client (registration / login only)."""
     url, key = _url_and_key()
     return create_client(url, key)
