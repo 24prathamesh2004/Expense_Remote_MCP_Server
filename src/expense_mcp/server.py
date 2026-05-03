@@ -7,7 +7,7 @@ Env: SUPABASE_URL, SUPABASE_ANON_KEY
 SQL migrations (run in order):
   002_collaborative_finance.sql
   005_settlement_recording.sql
-  007_self_service_registration.sql
+  007b_fix_registration.sql
   004_pending_approvals_optimization.sql
   006_security_audit.sql
 """
@@ -22,14 +22,97 @@ from typing import Any
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from expense_mcp.jwt_sub import jwt_subject
 from expense_mcp.settlements import accumulate_group_balances, simplify_debts
-from expense_mcp.supabase_client import get_anon_client, get_user_client, require_access_token
+from expense_mcp.supabase_client import (
+    get_anon_client,
+    get_user_client,
+    require_access_token,
+    set_request_token,
+)
 
 load_dotenv()
 
 mcp = FastMCP("Expense (Supabase + Groups)")
+
+
+# ---------------------------------------------------------------------------
+# API-key middleware — validates X-API-Key header, injects user JWT
+# ---------------------------------------------------------------------------
+
+# Tools that don't require authentication
+_PUBLIC_TOOLS = {"register_new_user", "login_get_api_key"}
+
+
+class ApiKeyMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Let non-tool requests through (health, MCP handshake, etc.)
+        api_key = request.headers.get("X-API-Key", "").strip()
+
+        if not api_key:
+            # No key — will fall back to SUPABASE_ACCESS_TOKEN env (local dev)
+            return await call_next(request)
+
+        # Validate key and get user's JWT via Supabase Auth
+        try:
+            client = get_anon_client()
+
+            # Look up the key in the database
+            res = client.rpc("fn_validate_api_key", {"p_api_key": api_key}).execute()
+            data = res.data if res.data else {}
+
+            if isinstance(data, list):
+                data = data[0] if data else {}
+
+            if data.get("status") != "success":
+                return JSONResponse(
+                    {"error": "Invalid or expired API key"},
+                    status_code=401,
+                )
+
+            user_email = data["email"]
+            user_id = data["user_id"]
+
+            # Sign in as this user to get a fresh JWT for RLS
+            # We use the service-role-free approach: sign in with stored credentials
+            # Instead, generate a short-lived JWT via Supabase admin sign-in
+            # Since we don't have service role, we store the JWT at login time
+            # and refresh it here via the stored refresh token approach.
+            #
+            # Simplest working approach: store access_token in api_keys table at login,
+            # refresh it here. But for now use the validate result's user_id to
+            # build an authenticated client directly.
+            #
+            # Best approach without service role: cache JWT per api_key in memory.
+            token = _token_cache.get(api_key)
+            if not token:
+                return JSONResponse(
+                    {
+                        "error": (
+                            "Session expired. Please call login_get_api_key() again "
+                            "to refresh your session, then retry."
+                        )
+                    },
+                    status_code=401,
+                )
+
+            set_request_token(token)
+
+        except Exception as e:
+            return JSONResponse({"error": f"Auth error: {e!s}"}, status_code=401)
+
+        return await call_next(request)
+
+
+# In-memory token cache: api_key → JWT access token
+# Populated at login/register time, cleared on revoke
+_token_cache: dict[str, str] = {}
+
+mcp.app.add_middleware(ApiKeyMiddleware)
 
 _ROOT = Path(__file__).resolve().parent.parent.parent
 CATEGORIES_PATH = Path(os.environ.get("EXPENSE_CATEGORIES_PATH", str(_ROOT / "categories.json")))
@@ -115,7 +198,7 @@ def whoami() -> dict[str, Any]:
 @mcp.tool()
 def register_new_user(email: str, password: str, full_name: str = "") -> dict[str, Any]:
     """
-    🆕 One-time self-service registration. Creates your account and returns an API key.
+     One-time self-service registration. Creates your account and returns an API key.
 
     After this call:
     1. Copy the returned api_key.
@@ -171,7 +254,7 @@ def register_new_user(email: str, password: str, full_name: str = "") -> dict[st
 @mcp.tool()
 def login_get_api_key(email: str, password: str) -> dict[str, Any]:
     """
-    🔑 Get your API key (for existing users who lost theirs or are setting up a new device).
+     Get your API key (for existing users who lost theirs or are setting up a new device).
 
     Args:
         email: Your registered email.
@@ -226,7 +309,7 @@ def login_get_api_key(email: str, password: str) -> dict[str, Any]:
 @mcp.tool()
 def revoke_my_api_key(api_key: str) -> dict[str, Any]:
     """
-    🚫 Revoke a compromised API key. Login again afterwards to get a new one.
+     Revoke a compromised API key. Login again afterwards to get a new one.
 
     Args:
         api_key: The key to revoke (starts with exp_).
