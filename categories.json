@@ -1,0 +1,199 @@
+{
+  "categories": [
+    {
+      "name": "Food & Dining",
+      "subcategories": [
+        "Restaurants",
+        "Street Food",
+        "Cafes & Tea",
+        "Sweets & Snacks",
+        "Food Delivery",
+        "Tiffin Service"
+      ]
+    },
+    {
+      "name": "Groceries",
+      "subcategories": [
+        "Vegetables & Fruits",
+        "Dairy & Eggs",
+        "Staples & Grains",
+        "Packaged Foods",
+        "Household Items"
+      ]
+    },
+    {
+      "name": "Transportation",
+      "subcategories": [
+        "Auto/Rickshaw",
+        "Taxi/Ola/Uber",
+        "Metro/Local Train",
+        "Bus",
+        "Parking",
+        "Toll"
+      ]
+    },
+    {
+      "name": "Fuel & Vehicle",
+      "subcategories": [
+        "Petrol/Diesel",
+        "CNG",
+        "Vehicle Maintenance",
+        "Vehicle Insurance",
+        "Two-Wheeler Service",
+        "Car Service"
+      ]
+    },
+    {
+      "name": "Shopping",
+      "subcategories": [
+        "Clothing",
+        "Footwear",
+        "Electronics",
+        "Books & Stationery",
+        "Gifts",
+        "Online Shopping"
+      ]
+    },
+    {
+      "name": "Entertainment",
+      "subcategories": [
+        "Movies",
+        "Events & Concerts",
+        "Streaming Services",
+        "Gaming",
+        "Sports & Fitness",
+        "Hobbies"
+      ]
+    },
+    {
+      "name": "Bills & Utilities",
+      "subcategories": [
+        "Electricity",
+        "Water",
+        "Gas/LPG",
+        "Maintenance Charges",
+        "Property Tax",
+        "DTH/Cable TV"
+      ]
+    },
+    {
+      "name": "Mobile & Internet",
+      "subcategories": [
+        "Mobile Recharge",
+        "Broadband/WiFi",
+        "DTH Recharge",
+        "OTT Subscriptions"
+      ]
+    },
+    {
+      "name": "Healthcare",
+      "subcategories": [
+        "Doctor Consultation",
+        "Medicines",
+        "Lab Tests",
+        "Hospital Bills",
+        "Health Insurance",
+        "Dental Care"
+      ]
+    },
+    {
+      "name": "Travel",
+      "subcategories": [
+        "Flight Tickets",
+        "Train Tickets",
+        "Bus Tickets",
+        "Hotel/Accommodation",
+        "Travel Insurance",
+        "Visa & Documents"
+      ]
+    },
+    {
+      "name": "Education",
+      "subcategories": [
+        "School Fees",
+        "Tuition Classes",
+        "Books & Supplies",
+        "Online Courses",
+        "Exam Fees",
+        "Coaching"
+      ]
+    },
+    {
+      "name": "Rent",
+      "subcategories": [
+        "House Rent",
+        "PG/Hostel",
+        "Security Deposit",
+        "Brokerage"
+      ]
+    },
+    {
+      "name": "EMI & Loans",
+      "subcategories": [
+        "Home Loan EMI",
+        "Car Loan EMI",
+        "Personal Loan EMI",
+        "Credit Card Payment",
+        "Education Loan EMI"
+      ]
+    },
+    {
+      "name": "Investments",
+      "subcategories": [
+        "Mutual Funds",
+        "Fixed Deposits",
+        "PPF/EPF",
+        "Stocks",
+        "Gold",
+        "Insurance Premium"
+      ]
+    },
+    {
+      "name": "Donations",
+      "subcategories": [
+        "Charity",
+        "Religious",
+        "NGO Contributions",
+        "Temple/Church/Mosque"
+      ]
+    },
+    {
+      "name": "Personal Care",
+      "subcategories": [
+        "Salon/Barber",
+        "Cosmetics",
+        "Spa & Wellness",
+        "Gym Membership"
+      ]
+    },
+    {
+      "name": "Household",
+      "subcategories": [
+        "Furniture",
+        "Appliances",
+        "Home Decor",
+        "Repairs & Maintenance",
+        "Cleaning Supplies",
+        "Maid/Cook Salary"
+      ]
+    },
+    {
+      "name": "Business",
+      "subcategories": [
+        "Office Supplies",
+        "Business Travel",
+        "Client Meetings",
+        "Software/Tools",
+        "Professional Services"
+      ]
+    },
+    {
+      "name": "Other",
+      "subcategories": [
+        "Miscellaneous",
+        "Emergency",
+        "Uncategorized"
+      ]
+    }
+  ]
+}
