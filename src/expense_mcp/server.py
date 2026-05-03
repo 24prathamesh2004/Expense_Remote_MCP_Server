@@ -128,12 +128,42 @@ def register_new_user(email: str, password: str, full_name: str = "") -> dict[st
         full_name: Optional display name.
     """
     try:
-        res = get_anon_client().rpc(
-            "fn_register_user",
-            {"p_email": email, "p_password": password, "p_full_name": full_name or ""},
-        ).execute()
-        data = getattr(res, "data", {})
-        return data if isinstance(data, dict) else _err("Unexpected response from registration")
+        client = get_anon_client()
+
+        # Use Supabase Auth to create the user
+        auth_response = client.auth.sign_up({
+            "email": email,
+            "password": password,
+            "options": {"data": {"full_name": full_name or ""}},
+        })
+
+        if not auth_response.user:
+            return _err("Registration failed: could not create user.")
+
+        user_id = str(auth_response.user.id)
+        access_token = auth_response.session.access_token if auth_response.session else None
+
+        if not access_token:
+            return _err(
+                "User created but no session returned. "
+                "Email confirmation may be required — disable it in Supabase Auth settings."
+            )
+
+        # Authenticate the client with the new user's token to call the RPC
+        client.postgrest.auth(access_token)
+        res = client.rpc("fn_generate_api_key", {"p_user_id": user_id, "p_key_name": "Default Key"}).execute()
+        api_key = getattr(res, "data", None)
+
+        if not api_key:
+            return _err("User created but API key generation failed.")
+
+        return {
+            "status": "success",
+            "user_id": user_id,
+            "email": email,
+            "api_key": api_key,
+            "message": "Registration successful! Save your API key — it won't be shown again.",
+        }
     except Exception as e:
         return _err(f"Registration failed: {e!s}")
 
@@ -141,19 +171,54 @@ def register_new_user(email: str, password: str, full_name: str = "") -> dict[st
 @mcp.tool()
 def login_get_api_key(email: str, password: str) -> dict[str, Any]:
     """
-    🔑 Get your API key (for existing users who lost theirs or set up a new device).
+    🔑 Get your API key (for existing users who lost theirs or are setting up a new device).
 
     Args:
         email: Your registered email.
         password: Your password.
     """
     try:
-        res = get_anon_client().rpc(
-            "fn_login_get_key",
-            {"p_email": email, "p_password": password},
-        ).execute()
-        data = getattr(res, "data", {})
-        return data if isinstance(data, dict) else _err("Unexpected response from login")
+        client = get_anon_client()
+
+        # Sign in via Supabase Auth
+        auth_response = client.auth.sign_in_with_password({"email": email, "password": password})
+
+        if not auth_response.user or not auth_response.session:
+            return _err("Invalid email or password.")
+
+        user_id = str(auth_response.user.id)
+        access_token = auth_response.session.access_token
+
+        # Authenticate and look for existing active key, or generate a new one
+        client.postgrest.auth(access_token)
+        existing = (
+            client.table("api_keys")
+            .select("api_key")
+            .eq("user_id", user_id)
+            .eq("is_active", True)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+
+        if existing.data:
+            api_key = existing.data[0]["api_key"]
+        else:
+            res = client.rpc("fn_generate_api_key", {
+                "p_user_id": user_id,
+                "p_key_name": f"Login Key",
+            }).execute()
+            api_key = getattr(res, "data", None)
+            if not api_key:
+                return _err("Login succeeded but API key generation failed.")
+
+        return {
+            "status": "success",
+            "user_id": user_id,
+            "email": email,
+            "api_key": api_key,
+            "message": "Login successful! Use this API key in your Claude Desktop config.",
+        }
     except Exception as e:
         return _err(f"Login failed: {e!s}")
 
