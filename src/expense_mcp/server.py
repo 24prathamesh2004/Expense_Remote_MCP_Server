@@ -21,10 +21,9 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastmcp import FastMCP
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import JSONResponse
 
 from expense_mcp.jwt_sub import jwt_subject
 from expense_mcp.settlements import accumulate_group_balances, simplify_debts
@@ -39,80 +38,9 @@ load_dotenv()
 
 mcp = FastMCP("Expense (Supabase + Groups)")
 
-
-# ---------------------------------------------------------------------------
-# API-key middleware — validates X-API-Key header, injects user JWT
-# ---------------------------------------------------------------------------
-
-# Tools that don't require authentication
-_PUBLIC_TOOLS = {"register_new_user", "login_get_api_key"}
-
-
-class ApiKeyMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        # Let non-tool requests through (health, MCP handshake, etc.)
-        api_key = request.headers.get("X-API-Key", "").strip()
-
-        if not api_key:
-            # No key — will fall back to SUPABASE_ACCESS_TOKEN env (local dev)
-            return await call_next(request)
-
-        # Validate key and get user's JWT via Supabase Auth
-        try:
-            client = get_anon_client()
-
-            # Look up the key in the database
-            res = client.rpc("fn_validate_api_key", {"p_api_key": api_key}).execute()
-            data = res.data if res.data else {}
-
-            if isinstance(data, list):
-                data = data[0] if data else {}
-
-            if data.get("status") != "success":
-                return JSONResponse(
-                    {"error": "Invalid or expired API key"},
-                    status_code=401,
-                )
-
-            user_email = data["email"]
-            user_id = data["user_id"]
-
-            # Sign in as this user to get a fresh JWT for RLS
-            # We use the service-role-free approach: sign in with stored credentials
-            # Instead, generate a short-lived JWT via Supabase admin sign-in
-            # Since we don't have service role, we store the JWT at login time
-            # and refresh it here via the stored refresh token approach.
-            #
-            # Simplest working approach: store access_token in api_keys table at login,
-            # refresh it here. But for now use the validate result's user_id to
-            # build an authenticated client directly.
-            #
-            # Best approach without service role: cache JWT per api_key in memory.
-            token = _token_cache.get(api_key)
-            if not token:
-                return JSONResponse(
-                    {
-                        "error": (
-                            "Session expired. Please call login_get_api_key() again "
-                            "to refresh your session, then retry."
-                        )
-                    },
-                    status_code=401,
-                )
-
-            set_request_token(token)
-
-        except Exception as e:
-            return JSONResponse({"error": f"Auth error: {e!s}"}, status_code=401)
-
-        return await call_next(request)
-
-
 # In-memory token cache: api_key → JWT access token
-# Populated at login/register time, cleared on revoke
+# Populated at login/register, cleared on revoke
 _token_cache: dict[str, str] = {}
-
-mcp.app.add_middleware(ApiKeyMiddleware)
 
 _ROOT = Path(__file__).resolve().parent.parent.parent
 CATEGORIES_PATH = Path(os.environ.get("EXPENSE_CATEGORIES_PATH", str(_ROOT / "categories.json")))
@@ -739,9 +667,38 @@ def categories() -> str:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    import uvicorn
+    from starlette.middleware.base import BaseHTTPMiddleware
+
     host = os.environ.get("MCP_HOST", "0.0.0.0")
-    port = int(os.environ.get("MCP_PORT", "8000"))
-    mcp.run(transport="http", host=host, port=port)
+    port = int(os.environ.get("PORT", os.environ.get("MCP_PORT", "8000")))
+
+    # Wrap MCP in FastAPI so we can attach middleware cleanly
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def api_key_middleware(request: Request, call_next):
+        api_key = request.headers.get("X-API-Key", "").strip()
+        if api_key:
+            token = _token_cache.get(api_key)
+            if token:
+                set_request_token(token)
+            else:
+                return JSONResponse(
+                    {
+                        "error": (
+                            "Session expired after server restart. "
+                            "Please call login_get_api_key() once to refresh your session."
+                        )
+                    },
+                    status_code=401,
+                )
+        return await call_next(request)
+
+    # Mount MCP — http_app() returns a Starlette/ASGI app
+    app.mount("/", mcp.http_app(path="/mcp"))
+
+    uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":
