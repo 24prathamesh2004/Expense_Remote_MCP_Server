@@ -21,8 +21,6 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
 from fastmcp import FastMCP
 
 from expense_mcp.jwt_sub import jwt_subject
@@ -31,6 +29,7 @@ from expense_mcp.supabase_client import (
     get_anon_client,
     get_user_client,
     require_access_token,
+    resolve_api_key,
     set_request_token,
 )
 
@@ -162,11 +161,20 @@ def register_new_user(email: str, password: str, full_name: str = "") -> dict[st
 
         # Authenticate the client with the new user's token to call the RPC
         client.postgrest.auth(access_token)
-        res = client.rpc("fn_generate_api_key", {"p_user_id": user_id, "p_key_name": "Default Key"}).execute()
+        refresh_token = auth_response.session.refresh_token or ""
+        res = client.rpc("fn_generate_api_key", {
+            "p_user_id": user_id,
+            "p_key_name": "Default Key",
+            "p_refresh_token": refresh_token,
+        }).execute()
         api_key = getattr(res, "data", None)
 
         if not api_key:
             return _err("User created but API key generation failed.")
+
+        # Cache JWT for immediate use
+        _token_cache[api_key] = access_token
+        set_request_token(access_token)
 
         return {
             "status": "success",
@@ -214,14 +222,23 @@ def login_get_api_key(email: str, password: str) -> dict[str, Any]:
 
         if existing.data:
             api_key = existing.data[0]["api_key"]
+            # Update refresh token for existing key
+            client.table("api_keys").update({
+                "refresh_token": auth_response.session.refresh_token or ""
+            }).eq("api_key", api_key).execute()
         else:
             res = client.rpc("fn_generate_api_key", {
                 "p_user_id": user_id,
-                "p_key_name": f"Login Key",
+                "p_key_name": "Login Key",
+                "p_refresh_token": auth_response.session.refresh_token or "",
             }).execute()
             api_key = getattr(res, "data", None)
             if not api_key:
                 return _err("Login succeeded but API key generation failed.")
+
+        # Cache JWT for immediate use
+        _token_cache[api_key] = access_token
+        set_request_token(access_token)
 
         return {
             "status": "success",
@@ -237,7 +254,7 @@ def login_get_api_key(email: str, password: str) -> dict[str, Any]:
 @mcp.tool()
 def revoke_my_api_key(api_key: str) -> dict[str, Any]:
     """
-     Revoke a compromised API key. Login again afterwards to get a new one.
+    🚫 Revoke a compromised API key. Login again afterwards to get a new one.
 
     Args:
         api_key: The key to revoke (starts with exp_).
@@ -245,9 +262,35 @@ def revoke_my_api_key(api_key: str) -> dict[str, Any]:
     try:
         res = get_user_client().rpc("fn_revoke_api_key", {"p_api_key": api_key}).execute()
         data = getattr(res, "data", {})
+        # Remove from cache immediately
+        _token_cache.pop(api_key, None)
         return data if isinstance(data, dict) else _err("Unexpected response")
     except Exception as e:
         return _err(f"Revoke failed: {e!s}")
+
+
+@mcp.tool()
+def connect(api_key: str) -> dict[str, Any]:
+    """
+    🔌 Restore your session after a server restart.
+
+    The server caches your session in memory. If the server restarts (e.g. after a deploy),
+    call this once with your API key to re-authenticate. After this, all tools work normally.
+
+    Args:
+        api_key: Your API key (starts with exp_).
+    """
+    try:
+        token = resolve_api_key(api_key, _token_cache)
+        if not token:
+            return _err(
+                "Could not restore session. "
+                "Please call login_get_api_key() to get a fresh session."
+            )
+        uid = jwt_subject(token)
+        return {"status": "success", "user_id": uid, "message": "Session restored. You're connected!"}
+    except Exception as e:
+        return _err(f"Connect failed: {e!s}")
 
 
 # ---------------------------------------------------------------------------
@@ -667,38 +710,9 @@ def categories() -> str:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    import uvicorn
-    from starlette.middleware.base import BaseHTTPMiddleware
-
     host = os.environ.get("MCP_HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", os.environ.get("MCP_PORT", "8000")))
-
-    # Wrap MCP in FastAPI so we can attach middleware cleanly
-    app = FastAPI()
-
-    @app.middleware("http")
-    async def api_key_middleware(request: Request, call_next):
-        api_key = request.headers.get("X-API-Key", "").strip()
-        if api_key:
-            token = _token_cache.get(api_key)
-            if token:
-                set_request_token(token)
-            else:
-                return JSONResponse(
-                    {
-                        "error": (
-                            "Session expired after server restart. "
-                            "Please call login_get_api_key() once to refresh your session."
-                        )
-                    },
-                    status_code=401,
-                )
-        return await call_next(request)
-
-    # Mount MCP — http_app() returns a Starlette/ASGI app
-    app.mount("/", mcp.http_app(path="/mcp"))
-
-    uvicorn.run(app, host=host, port=port)
+    mcp.run(transport="http", host=host, port=port)
 
 
 if __name__ == "__main__":
