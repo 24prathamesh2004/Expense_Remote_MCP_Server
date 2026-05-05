@@ -13,8 +13,9 @@ SQL migrations (run in order):
   005_settlement_recording.sql
   007b_fix_registration.sql
   008_api_key_refresh_token.sql
-  004_pending_approvals_optimization.sql  (optional, for performance)
-  006_security_audit.sql                  (optional, for hardening)
+  009_fix_invite_and_rls.sql
+  004_pending_approvals_optimization.sql  (optional)
+  006_security_audit.sql                  (optional)
 """
 
 from __future__ import annotations
@@ -31,10 +32,10 @@ from fastmcp import FastMCP
 from expense_mcp.jwt_sub import jwt_subject
 from expense_mcp.settlements import accumulate_group_balances, simplify_debts
 from expense_mcp.supabase_client import (
+    AuthedClient,
     get_anon_client,
     get_client_for_api_key,
     get_client_for_env_token,
-    get_jwt_from_client,
 )
 
 load_dotenv()
@@ -65,30 +66,22 @@ def _err(message: str) -> dict[str, str]:
 
 
 def _jsonable_row(row: dict[str, Any]) -> dict[str, Any]:
-    """Convert Decimal values to float for JSON serialisation."""
     return {k: float(v) if isinstance(v, Decimal) else v for k, v in row.items()}
 
 
-def _get_client(api_key: str):
-    """Return an authenticated Supabase client.
-
-    Production: validates api_key against DB, exchanges refresh token for JWT.
-    Local dev:  uses SUPABASE_ACCESS_TOKEN env var (api_key is empty string).
-    """
+def _get_ac(api_key: str) -> AuthedClient:
+    """Return an AuthedClient. Uses api_key in production, env token in local dev."""
     if api_key:
         return get_client_for_api_key(api_key)
     return get_client_for_env_token()
 
 
-def _with_pending_hint(payload: Any, client) -> dict[str, Any]:
-    """Wrap payload and attach pending-approvals summary.
-
-    Accepts the already-authenticated client to avoid a second auth round-trip.
-    """
+def _with_pending_hint(payload: Any, ac: AuthedClient) -> dict[str, Any]:
+    """Wrap payload and attach pending-approvals summary using the already-authed client."""
     try:
-        uid = jwt_subject(get_jwt_from_client(client))
+        uid = jwt_subject(ac.access_token)
         base: dict[str, Any] = {"result": payload}
-        res = client.rpc("fn_get_pending_count", {"p_user_id": uid}).execute()
+        res = ac.client.rpc("fn_get_pending_count", {"p_user_id": uid}).execute()
         if res.data:
             row = res.data[0]
             count = row.get("count", 0)
@@ -181,7 +174,6 @@ def login_get_api_key(email: str, password: str) -> dict[str, Any]:
 
         client.postgrest.auth(access_token)
 
-        # Get existing active key or generate a new one
         existing = (
             client.table("api_keys")
             .select("api_key")
@@ -193,7 +185,7 @@ def login_get_api_key(email: str, password: str) -> dict[str, Any]:
         )
         if existing.data:
             api_key = existing.data[0]["api_key"]
-            # Update refresh token via RPC so future calls work
+            # Store fresh refresh token so future calls work
             client.rpc("fn_update_api_key_refresh_token", {
                 "p_api_key": api_key,
                 "p_refresh_token": refresh_token,
@@ -223,8 +215,8 @@ def login_get_api_key(email: str, password: str) -> dict[str, Any]:
 def whoami(api_key: str = "") -> dict[str, Any]:
     """Return the current user's id. Confirms authentication is working."""
     try:
-        client = _get_client(api_key)
-        return {"status": "success", "user_id": jwt_subject(get_jwt_from_client(client))}
+        ac = _get_ac(api_key)
+        return {"status": "success", "user_id": jwt_subject(ac.access_token)}
     except Exception as e:
         return _err(str(e))
 
@@ -233,8 +225,8 @@ def whoami(api_key: str = "") -> dict[str, Any]:
 def revoke_my_api_key(api_key: str) -> dict[str, Any]:
     """🚫 Revoke a compromised API key. Call login_get_api_key() afterwards to get a new one."""
     try:
-        client = _get_client(api_key)
-        res = client.rpc("fn_revoke_api_key", {"p_api_key": api_key}).execute()
+        ac = _get_ac(api_key)
+        res = ac.client.rpc("fn_revoke_api_key", {"p_api_key": api_key}).execute()
         data = getattr(res, "data", {})
         return data if isinstance(data, dict) else _err("Unexpected response")
     except Exception as e:
@@ -256,9 +248,9 @@ def add_expense(
 ) -> dict[str, Any]:
     """Add a personal expense (no group). Amount in INR. Date format: YYYY-MM-DD."""
     try:
-        client = _get_client(api_key)
-        uid = jwt_subject(get_jwt_from_client(client))
-        res = client.table("transactions").insert({
+        ac = _get_ac(api_key)
+        uid = jwt_subject(ac.access_token)
+        res = ac.client.table("transactions").insert({
             "submitted_by": uid,
             "payer_id": uid,
             "expense_date": date,
@@ -270,12 +262,12 @@ def add_expense(
             "group_id": None,
         }).execute()
         if not res.data:
-            return _with_pending_hint(_err("Insert returned no data."), client)
+            return _with_pending_hint(_err("Insert returned no data."), ac)
         return _with_pending_hint({
             "status": "success",
             "id": str(res.data[0].get("id", "")),
             "message": "Expense added successfully",
-        }, client)
+        }, ac)
     except Exception as e:
         return {"result": _err(f"Database error: {e!s}")}
 
@@ -284,9 +276,9 @@ def add_expense(
 def list_expenses(api_key: str, start_date: str, end_date: str) -> dict[str, Any]:
     """List personal expenses in an inclusive date range (YYYY-MM-DD)."""
     try:
-        client = _get_client(api_key)
+        ac = _get_ac(api_key)
         res = (
-            client.table("transactions")
+            ac.client.table("transactions")
             .select("id,expense_date,amount,category,subcategory,note,created_at,status")
             .is_("group_id", None)
             .gte("expense_date", start_date)
@@ -294,7 +286,7 @@ def list_expenses(api_key: str, start_date: str, end_date: str) -> dict[str, Any
             .order("expense_date", desc=True)
             .execute()
         )
-        return _with_pending_hint([_jsonable_row(dict(r)) for r in (res.data or [])], client)
+        return _with_pending_hint([_jsonable_row(dict(r)) for r in (res.data or [])], ac)
     except Exception as e:
         return {"result": _err(f"Error listing expenses: {e!s}")}
 
@@ -308,9 +300,9 @@ def summarize(
 ) -> dict[str, Any]:
     """Personal spending totals by category for a date range."""
     try:
-        client = _get_client(api_key)
+        ac = _get_ac(api_key)
         q = (
-            client.table("transactions")
+            ac.client.table("transactions")
             .select("category,amount")
             .is_("group_id", None)
             .gte("expense_date", start_date)
@@ -330,7 +322,7 @@ def summarize(
             {"category": c, "total_amount": round(v["total_amount"], 2), "count": v["count"]}
             for c, v in sorted(buckets.items(), key=lambda x: -x[1]["total_amount"])
         ]
-        return _with_pending_hint(out, client)
+        return _with_pending_hint(out, ac)
     except Exception as e:
         return {"result": _err(f"Error summarizing: {e!s}")}
 
@@ -343,10 +335,10 @@ def summarize(
 def create_group(api_key: str, name: str, kind: str = "trip") -> dict[str, Any]:
     """Create a group and add caller as owner. kind: trip | family | team | personal_mirror."""
     try:
-        client = _get_client(api_key)
-        res = client.rpc("fn_create_group", {"p_name": name, "p_kind": kind}).execute()
+        ac = _get_ac(api_key)
+        res = ac.client.rpc("fn_create_group", {"p_name": name, "p_kind": kind}).execute()
         gid = getattr(res, "data", None)
-        return _with_pending_hint({"status": "success", "group_id": str(gid) if gid else None}, client)
+        return _with_pending_hint({"status": "success", "group_id": str(gid) if gid else None}, ac)
     except Exception as e:
         return {"result": _err(f"fn_create_group: {e!s}")}
 
@@ -355,19 +347,19 @@ def create_group(api_key: str, name: str, kind: str = "trip") -> dict[str, Any]:
 def list_my_groups(api_key: str) -> dict[str, Any]:
     """List all groups the signed-in user belongs to."""
     try:
-        client = _get_client(api_key)
-        uid = jwt_subject(get_jwt_from_client(client))
-        gm = client.table("group_members").select("group_id,role").eq("user_id", uid).execute()
+        ac = _get_ac(api_key)
+        uid = jwt_subject(ac.access_token)
+        gm = ac.client.table("group_members").select("group_id,role").eq("user_id", uid).execute()
         gids = [str(r["group_id"]) for r in (gm.data or [])]
         if not gids:
-            return _with_pending_hint([], client)
+            return _with_pending_hint([], ac)
         gr = (
-            client.table("groups")
+            ac.client.table("groups")
             .select("id,name,kind,created_at,settings")
             .in_("id", gids)
             .execute()
         )
-        return _with_pending_hint([_jsonable_row(dict(r)) for r in (gr.data or [])], client)
+        return _with_pending_hint([_jsonable_row(dict(r)) for r in (gr.data or [])], ac)
     except Exception as e:
         return {"result": _err(f"list_my_groups: {e!s}")}
 
@@ -376,12 +368,12 @@ def list_my_groups(api_key: str) -> dict[str, Any]:
 def create_group_invite(api_key: str, group_id: str, expires_in_days: int = 7) -> dict[str, Any]:
     """Generate an invite code for a group (share it out-of-band with the new member)."""
     try:
-        client = _get_client(api_key)
-        res = client.rpc(
+        ac = _get_ac(api_key)
+        res = ac.client.rpc(
             "fn_create_group_invite",
             {"p_group_id": group_id, "p_expires_in_days": expires_in_days},
         ).execute()
-        return _with_pending_hint({"status": "success", "invite_code": getattr(res, "data", None)}, client)
+        return _with_pending_hint({"status": "success", "invite_code": getattr(res, "data", None)}, ac)
     except Exception as e:
         return {"result": _err(f"fn_create_group_invite: {e!s}")}
 
@@ -390,13 +382,13 @@ def create_group_invite(api_key: str, group_id: str, expires_in_days: int = 7) -
 def redeem_group_invite(api_key: str, invite_code: str) -> dict[str, Any]:
     """Join a group using an invite code."""
     try:
-        client = _get_client(api_key)
-        res = client.rpc(
+        ac = _get_ac(api_key)
+        res = ac.client.rpc(
             "fn_redeem_group_invite",
             {"p_code": invite_code.strip().lower()},
         ).execute()
         gid = getattr(res, "data", None)
-        return _with_pending_hint({"status": "success", "group_id": str(gid) if gid else None}, client)
+        return _with_pending_hint({"status": "success", "group_id": str(gid) if gid else None}, ac)
     except Exception as e:
         return {"result": _err(f"redeem_group_invite: {e!s}")}
 
@@ -405,14 +397,14 @@ def redeem_group_invite(api_key: str, invite_code: str) -> dict[str, Any]:
 def list_group_members(api_key: str, group_id: str) -> dict[str, Any]:
     """List members of a group with their roles."""
     try:
-        client = _get_client(api_key)
+        ac = _get_ac(api_key)
         res = (
-            client.table("group_members")
+            ac.client.table("group_members")
             .select("user_id,role,joined_at")
             .eq("group_id", group_id)
             .execute()
         )
-        return _with_pending_hint([_jsonable_row(dict(r)) for r in (res.data or [])], client)
+        return _with_pending_hint([_jsonable_row(dict(r)) for r in (res.data or [])], ac)
     except Exception as e:
         return {"result": _err(f"list_group_members: {e!s}")}
 
@@ -438,8 +430,8 @@ def add_group_expense(
     payer_user_id defaults to the caller (the person who paid the bill).
     """
     try:
-        client = _get_client(api_key)
-        res = client.rpc("fn_add_group_expense", {
+        ac = _get_ac(api_key)
+        res = ac.client.rpc("fn_add_group_expense", {
             "p_group_id": group_id,
             "p_expense_date": expense_date,
             "p_amount": amount,
@@ -450,7 +442,7 @@ def add_group_expense(
         }).execute()
         tid = getattr(res, "data", None)
         return _with_pending_hint(
-            {"status": "success", "transaction_id": str(tid) if tid else None}, client
+            {"status": "success", "transaction_id": str(tid) if tid else None}, ac
         )
     except Exception as e:
         return {"result": _err(f"fn_add_group_expense: {e!s}")}
@@ -460,12 +452,12 @@ def add_group_expense(
 def vote_on_transaction(api_key: str, transaction_id: str, vote: str) -> dict[str, Any]:
     """Vote approve or reject on a pending group expense. Cannot vote on your own submission."""
     try:
-        client = _get_client(api_key)
-        res = client.rpc(
+        ac = _get_ac(api_key)
+        res = ac.client.rpc(
             "fn_vote_on_transaction",
             {"p_transaction_id": transaction_id, "p_vote": vote.strip().lower()},
         ).execute()
-        return _with_pending_hint({"status": "success", "vote_result": getattr(res, "data", None)}, client)
+        return _with_pending_hint({"status": "success", "vote_result": getattr(res, "data", None)}, ac)
     except Exception as e:
         return {"result": _err(f"vote: {e!s}")}
 
@@ -486,16 +478,16 @@ def reject_group_expense(api_key: str, transaction_id: str) -> dict[str, Any]:
 def list_pending_group_expenses(api_key: str, group_id: str) -> dict[str, Any]:
     """List all pending expenses for a group."""
     try:
-        client = _get_client(api_key)
+        ac = _get_ac(api_key)
         res = (
-            client.table("transactions")
+            ac.client.table("transactions")
             .select("id,submitted_by,payer_id,expense_date,amount,category,subcategory,note,status")
             .eq("group_id", group_id)
             .eq("status", "pending")
             .order("expense_date", desc=True)
             .execute()
         )
-        return _with_pending_hint([_jsonable_row(dict(r)) for r in (res.data or [])], client)
+        return _with_pending_hint([_jsonable_row(dict(r)) for r in (res.data or [])], ac)
     except Exception as e:
         return {"result": _err(f"list_pending_group_expenses: {e!s}")}
 
@@ -504,15 +496,15 @@ def list_pending_group_expenses(api_key: str, group_id: str) -> dict[str, Any]:
 def list_my_pending_approvals(api_key: str) -> dict[str, Any]:
     """List all group expenses waiting for your approval."""
     try:
-        client = _get_client(api_key)
-        uid = jwt_subject(get_jwt_from_client(client))
-        res = client.rpc("fn_get_pending_count", {"p_user_id": uid}).execute()
+        ac = _get_ac(api_key)
+        uid = jwt_subject(ac.access_token)
+        res = ac.client.rpc("fn_get_pending_count", {"p_user_id": uid}).execute()
         if res.data:
             row = res.data[0]
             return _with_pending_hint(
-                {"count": row.get("count", 0), "items": row.get("sample") or []}, client
+                {"count": row.get("count", 0), "items": row.get("sample") or []}, ac
             )
-        return _with_pending_hint({"count": 0, "items": []}, client)
+        return _with_pending_hint({"count": 0, "items": []}, ac)
     except Exception as e:
         return {"result": _err(f"list_my_pending_approvals: {e!s}")}
 
@@ -526,9 +518,9 @@ def list_group_transactions(
 ) -> dict[str, Any]:
     """List all transactions for a group, optionally filtered by date range."""
     try:
-        client = _get_client(api_key)
+        ac = _get_ac(api_key)
         q = (
-            client.table("transactions")
+            ac.client.table("transactions")
             .select(
                 "id,submitted_by,payer_id,expense_date,amount,"
                 "category,subcategory,note,status,created_at"
@@ -540,7 +532,7 @@ def list_group_transactions(
         if end_date:
             q = q.lte("expense_date", end_date)
         res = q.order("expense_date", desc=True).execute()
-        return _with_pending_hint([_jsonable_row(dict(r)) for r in (res.data or [])], client)
+        return _with_pending_hint([_jsonable_row(dict(r)) for r in (res.data or [])], ac)
     except Exception as e:
         return {"result": _err(f"list_group_transactions: {e!s}")}
 
@@ -556,22 +548,22 @@ def group_balances(api_key: str, group_id: str, include_settlements: bool = True
     Positive = others owe them. Negative = they owe others.
     """
     try:
-        client = _get_client(api_key)
+        ac = _get_ac(api_key)
         if include_settlements:
-            res = client.rpc(
+            res = ac.client.rpc(
                 "fn_group_balances_with_settlements", {"p_group_id": group_id}
             ).execute()
             net = {str(r["user_id"]): float(r["net_balance"]) for r in (res.data or [])}
         else:
             res = (
-                client.table("transactions")
+                ac.client.table("transactions")
                 .select("id,payer_id,amount,transaction_splits(member_id,share_amount)")
                 .eq("group_id", group_id)
                 .eq("status", "approved")
                 .execute()
             )
             net = accumulate_group_balances(res.data or [])
-        return _with_pending_hint({"group_id": group_id, "net_by_user_id": net}, client)
+        return _with_pending_hint({"group_id": group_id, "net_by_user_id": net}, ac)
     except Exception as e:
         return {"result": _err(f"group_balances: {e!s}")}
 
@@ -580,15 +572,15 @@ def group_balances(api_key: str, group_id: str, include_settlements: bool = True
 def simplify_group_debts(api_key: str, group_id: str, include_settlements: bool = True) -> dict[str, Any]:
     """Suggest the minimum set of transfers (in INR) to fully settle the group."""
     try:
-        client = _get_client(api_key)
+        ac = _get_ac(api_key)
         if include_settlements:
-            res = client.rpc(
+            res = ac.client.rpc(
                 "fn_group_balances_with_settlements", {"p_group_id": group_id}
             ).execute()
             net = {str(r["user_id"]): float(r["net_balance"]) for r in (res.data or [])}
         else:
             res = (
-                client.table("transactions")
+                ac.client.table("transactions")
                 .select("id,payer_id,amount,transaction_splits(member_id,share_amount)")
                 .eq("group_id", group_id)
                 .eq("status", "approved")
@@ -599,7 +591,7 @@ def simplify_group_debts(api_key: str, group_id: str, include_settlements: bool 
             "group_id": group_id,
             "net_by_user_id": net,
             "suggested_transfers": simplify_debts(net),
-        }, client)
+        }, ac)
     except Exception as e:
         return {"result": _err(f"simplify_group_debts: {e!s}")}
 
@@ -617,15 +609,9 @@ def record_settlement(
     """
     Record a real payment between members (UPI, PhonePe, GPay, cash, etc.).
     This reduces the outstanding balance. Call after the money has actually moved.
-
-    Args:
-        from_user_id: Who paid (debtor).
-        to_user_id: Who received (creditor).
-        amount: Amount in INR.
-        note: e.g. "PhonePe", "GPay", "Cash".
     """
     try:
-        client = _get_client(api_key)
+        ac = _get_ac(api_key)
         args: dict[str, Any] = {
             "p_group_id": group_id,
             "p_from_user_id": from_user_id,
@@ -635,13 +621,13 @@ def record_settlement(
         }
         if payment_date:
             args["p_payment_date"] = payment_date
-        res = client.rpc("fn_record_settlement", args).execute()
+        res = ac.client.rpc("fn_record_settlement", args).execute()
         sid = getattr(res, "data", None)
         return _with_pending_hint({
             "status": "success",
             "settlement_id": str(sid) if sid else None,
             "message": f"Recorded: {from_user_id} → {to_user_id} ₹{amount}",
-        }, client)
+        }, ac)
     except Exception as e:
         return {"result": _err(f"record_settlement: {e!s}")}
 
@@ -655,9 +641,9 @@ def list_group_settlements(
 ) -> dict[str, Any]:
     """List recorded settlement payments for a group."""
     try:
-        client = _get_client(api_key)
+        ac = _get_ac(api_key)
         q = (
-            client.table("settlement_payments")
+            ac.client.table("settlement_payments")
             .select("id,from_user_id,to_user_id,amount,payment_date,note,recorded_by,created_at")
             .eq("group_id", group_id)
         )
@@ -666,7 +652,7 @@ def list_group_settlements(
         if end_date:
             q = q.lte("payment_date", end_date)
         res = q.order("payment_date", desc=True).execute()
-        return _with_pending_hint([_jsonable_row(dict(r)) for r in (res.data or [])], client)
+        return _with_pending_hint([_jsonable_row(dict(r)) for r in (res.data or [])], ac)
     except Exception as e:
         return {"result": _err(f"list_group_settlements: {e!s}")}
 
