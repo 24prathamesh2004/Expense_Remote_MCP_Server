@@ -1,15 +1,20 @@
 """
 FastMCP expense + group finance (Supabase).
 
+Auth model: every tool accepts api_key as the first argument.
+No in-memory session state — each call validates the key and exchanges
+the stored refresh token for a fresh JWT. Stateless and restart-safe.
+
 Env: SUPABASE_URL, SUPABASE_ANON_KEY
-     SUPABASE_ACCESS_TOKEN  (local dev only — production uses API keys via DB)
+     SUPABASE_ACCESS_TOKEN  (local dev only, skips api_key param)
 
 SQL migrations (run in order):
   002_collaborative_finance.sql
   005_settlement_recording.sql
   007b_fix_registration.sql
-  004_pending_approvals_optimization.sql
-  006_security_audit.sql
+  008_api_key_refresh_token.sql
+  004_pending_approvals_optimization.sql  (optional, for performance)
+  006_security_audit.sql                  (optional, for hardening)
 """
 
 from __future__ import annotations
@@ -27,44 +32,26 @@ from expense_mcp.jwt_sub import jwt_subject
 from expense_mcp.settlements import accumulate_group_balances, simplify_debts
 from expense_mcp.supabase_client import (
     get_anon_client,
-    get_user_client,
-    require_access_token,
-    resolve_api_key,
-    set_request_token,
+    get_client_for_api_key,
+    get_client_for_env_token,
+    get_jwt_from_client,
 )
 
 load_dotenv()
 
 mcp = FastMCP("Expense (Supabase + Groups)")
 
-# In-memory token cache: api_key → JWT access token
-# Populated at login/register, cleared on revoke
-_token_cache: dict[str, str] = {}
-
 _ROOT = Path(__file__).resolve().parent.parent.parent
-CATEGORIES_PATH = Path(os.environ.get("EXPENSE_CATEGORIES_PATH", str(_ROOT / "categories.json")))
+CATEGORIES_PATH = Path(
+    os.environ.get("EXPENSE_CATEGORIES_PATH", str(_ROOT / "categories.json"))
+)
 
 _DEFAULT_CATEGORIES = {
     "categories": [
-        "Food & Dining",
-        "Groceries",
-        "Transportation",
-        "Fuel & Vehicle",
-        "Shopping",
-        "Entertainment",
-        "Bills & Utilities",
-        "Mobile & Internet",
-        "Healthcare",
-        "Travel",
-        "Education",
-        "Rent",
-        "EMI & Loans",
-        "Investments",
-        "Donations",
-        "Personal Care",
-        "Household",
-        "Business",
-        "Other",
+        "Food & Dining", "Groceries", "Transportation", "Fuel & Vehicle",
+        "Shopping", "Entertainment", "Bills & Utilities", "Mobile & Internet",
+        "Healthcare", "Travel", "Education", "Rent", "EMI & Loans",
+        "Investments", "Donations", "Personal Care", "Household", "Business", "Other",
     ]
 }
 
@@ -78,21 +65,28 @@ def _err(message: str) -> dict[str, str]:
 
 
 def _jsonable_row(row: dict[str, Any]) -> dict[str, Any]:
-    """Convert Decimal/date values to JSON-serialisable types."""
-    out: dict[str, Any] = {}
-    for k, v in row.items():
-        if isinstance(v, Decimal):
-            out[k] = float(v)
-        else:
-            out[k] = v
-    return out
+    """Convert Decimal values to float for JSON serialisation."""
+    return {k: float(v) if isinstance(v, Decimal) else v for k, v in row.items()}
 
 
-def _with_pending_hint(payload: Any) -> dict[str, Any]:
-    """Wrap payload and attach pending-approvals summary (single RPC via materialized view)."""
+def _get_client(api_key: str):
+    """Return an authenticated Supabase client.
+
+    Production: validates api_key against DB, exchanges refresh token for JWT.
+    Local dev:  uses SUPABASE_ACCESS_TOKEN env var (api_key is empty string).
+    """
+    if api_key:
+        return get_client_for_api_key(api_key)
+    return get_client_for_env_token()
+
+
+def _with_pending_hint(payload: Any, client) -> dict[str, Any]:
+    """Wrap payload and attach pending-approvals summary.
+
+    Accepts the already-authenticated client to avoid a second auth round-trip.
+    """
     try:
-        uid = jwt_subject(require_access_token())
-        client = get_user_client()
+        uid = jwt_subject(get_jwt_from_client(client))
         base: dict[str, Any] = {"result": payload}
         res = client.rpc("fn_get_pending_count", {"p_user_id": uid}).execute()
         if res.data:
@@ -109,23 +103,13 @@ def _with_pending_hint(payload: Any) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Auth / Registration tools
+# Auth / Registration tools  (no api_key needed)
 # ---------------------------------------------------------------------------
-
-@mcp.tool()
-def whoami() -> dict[str, Any]:
-    """Return the current user's id (JWT sub). Useful to confirm authentication is working."""
-    try:
-        sub = jwt_subject(require_access_token())
-        return {"status": "success", "user_id": sub}
-    except Exception as e:
-        return _err(str(e))
-
 
 @mcp.tool()
 def register_new_user(email: str, password: str, full_name: str = "") -> dict[str, Any]:
     """
-     One-time self-service registration. Creates your account and returns an API key.
+    🆕 One-time self-service registration. Creates your account and returns an API key.
 
     After this call:
     1. Copy the returned api_key.
@@ -139,42 +123,31 @@ def register_new_user(email: str, password: str, full_name: str = "") -> dict[st
     """
     try:
         client = get_anon_client()
-
-        # Use Supabase Auth to create the user
-        auth_response = client.auth.sign_up({
+        auth_res = client.auth.sign_up({
             "email": email,
             "password": password,
             "options": {"data": {"full_name": full_name or ""}},
         })
-
-        if not auth_response.user:
+        if not auth_res.user:
             return _err("Registration failed: could not create user.")
-
-        user_id = str(auth_response.user.id)
-        access_token = auth_response.session.access_token if auth_response.session else None
-
-        if not access_token:
+        if not auth_res.session:
             return _err(
                 "User created but no session returned. "
-                "Email confirmation may be required — disable it in Supabase Auth settings."
+                "Disable 'Confirm email' in Supabase → Authentication → Providers → Email."
             )
+        user_id = str(auth_res.user.id)
+        access_token = auth_res.session.access_token
+        refresh_token = auth_res.session.refresh_token or ""
 
-        # Authenticate the client with the new user's token to call the RPC
         client.postgrest.auth(access_token)
-        refresh_token = auth_response.session.refresh_token or ""
         res = client.rpc("fn_generate_api_key", {
             "p_user_id": user_id,
             "p_key_name": "Default Key",
             "p_refresh_token": refresh_token,
         }).execute()
         api_key = getattr(res, "data", None)
-
         if not api_key:
             return _err("User created but API key generation failed.")
-
-        # Cache JWT for immediate use
-        _token_cache[api_key] = access_token
-        set_request_token(access_token)
 
         return {
             "status": "success",
@@ -190,7 +163,7 @@ def register_new_user(email: str, password: str, full_name: str = "") -> dict[st
 @mcp.tool()
 def login_get_api_key(email: str, password: str) -> dict[str, Any]:
     """
-     Get your API key (for existing users who lost theirs or are setting up a new device).
+    🔑 Get your API key. Use this if you lost your key or are setting up a new device.
 
     Args:
         email: Your registered email.
@@ -198,18 +171,17 @@ def login_get_api_key(email: str, password: str) -> dict[str, Any]:
     """
     try:
         client = get_anon_client()
-
-        # Sign in via Supabase Auth
-        auth_response = client.auth.sign_in_with_password({"email": email, "password": password})
-
-        if not auth_response.user or not auth_response.session:
+        auth_res = client.auth.sign_in_with_password({"email": email, "password": password})
+        if not auth_res.user or not auth_res.session:
             return _err("Invalid email or password.")
 
-        user_id = str(auth_response.user.id)
-        access_token = auth_response.session.access_token
+        user_id = str(auth_res.user.id)
+        access_token = auth_res.session.access_token
+        refresh_token = auth_res.session.refresh_token or ""
 
-        # Authenticate and look for existing active key, or generate a new one
         client.postgrest.auth(access_token)
+
+        # Get existing active key or generate a new one
         existing = (
             client.table("api_keys")
             .select("api_key")
@@ -219,26 +191,22 @@ def login_get_api_key(email: str, password: str) -> dict[str, Any]:
             .limit(1)
             .execute()
         )
-
         if existing.data:
             api_key = existing.data[0]["api_key"]
-            # Update refresh token for existing key
-            client.table("api_keys").update({
-                "refresh_token": auth_response.session.refresh_token or ""
-            }).eq("api_key", api_key).execute()
+            # Update refresh token via RPC so future calls work
+            client.rpc("fn_update_api_key_refresh_token", {
+                "p_api_key": api_key,
+                "p_refresh_token": refresh_token,
+            }).execute()
         else:
             res = client.rpc("fn_generate_api_key", {
                 "p_user_id": user_id,
                 "p_key_name": "Login Key",
-                "p_refresh_token": auth_response.session.refresh_token or "",
+                "p_refresh_token": refresh_token,
             }).execute()
             api_key = getattr(res, "data", None)
             if not api_key:
                 return _err("Login succeeded but API key generation failed.")
-
-        # Cache JWT for immediate use
-        _token_cache[api_key] = access_token
-        set_request_token(access_token)
 
         return {
             "status": "success",
@@ -252,45 +220,25 @@ def login_get_api_key(email: str, password: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def revoke_my_api_key(api_key: str) -> dict[str, Any]:
-    """
-    🚫 Revoke a compromised API key. Login again afterwards to get a new one.
-
-    Args:
-        api_key: The key to revoke (starts with exp_).
-    """
+def whoami(api_key: str = "") -> dict[str, Any]:
+    """Return the current user's id. Confirms authentication is working."""
     try:
-        res = get_user_client().rpc("fn_revoke_api_key", {"p_api_key": api_key}).execute()
-        data = getattr(res, "data", {})
-        # Remove from cache immediately
-        _token_cache.pop(api_key, None)
-        return data if isinstance(data, dict) else _err("Unexpected response")
+        client = _get_client(api_key)
+        return {"status": "success", "user_id": jwt_subject(get_jwt_from_client(client))}
     except Exception as e:
-        return _err(f"Revoke failed: {e!s}")
+        return _err(str(e))
 
 
 @mcp.tool()
-def connect(api_key: str) -> dict[str, Any]:
-    """
-    🔌 Restore your session after a server restart.
-
-    The server caches your session in memory. If the server restarts (e.g. after a deploy),
-    call this once with your API key to re-authenticate. After this, all tools work normally.
-
-    Args:
-        api_key: Your API key (starts with exp_).
-    """
+def revoke_my_api_key(api_key: str) -> dict[str, Any]:
+    """🚫 Revoke a compromised API key. Call login_get_api_key() afterwards to get a new one."""
     try:
-        token = resolve_api_key(api_key, _token_cache)
-        if not token:
-            return _err(
-                "Could not restore session. "
-                "Please call login_get_api_key() to get a fresh session."
-            )
-        uid = jwt_subject(token)
-        return {"status": "success", "user_id": uid, "message": "Session restored. You're connected!"}
+        client = _get_client(api_key)
+        res = client.rpc("fn_revoke_api_key", {"p_api_key": api_key}).execute()
+        data = getattr(res, "data", {})
+        return data if isinstance(data, dict) else _err("Unexpected response")
     except Exception as e:
-        return _err(f"Connect failed: {e!s}")
+        return _err(f"Revoke failed: {e!s}")
 
 
 # ---------------------------------------------------------------------------
@@ -299,16 +247,18 @@ def connect(api_key: str) -> dict[str, Any]:
 
 @mcp.tool()
 def add_expense(
+    api_key: str,
     date: str,
     amount: float,
     category: str,
     subcategory: str = "",
     note: str = "",
 ) -> dict[str, Any]:
-    """Add a personal expense (no group). Amount in INR."""
+    """Add a personal expense (no group). Amount in INR. Date format: YYYY-MM-DD."""
     try:
-        uid = jwt_subject(require_access_token())
-        res = get_user_client().table("transactions").insert({
+        client = _get_client(api_key)
+        uid = jwt_subject(get_jwt_from_client(client))
+        res = client.table("transactions").insert({
             "submitted_by": uid,
             "payer_id": uid,
             "expense_date": date,
@@ -320,22 +270,23 @@ def add_expense(
             "group_id": None,
         }).execute()
         if not res.data:
-            return _with_pending_hint(_err("Insert returned no data."))
+            return _with_pending_hint(_err("Insert returned no data."), client)
         return _with_pending_hint({
             "status": "success",
             "id": str(res.data[0].get("id", "")),
             "message": "Expense added successfully",
-        })
+        }, client)
     except Exception as e:
-        return _with_pending_hint(_err(f"Database error: {e!s}"))
+        return {"result": _err(f"Database error: {e!s}")}
 
 
 @mcp.tool()
-def list_expenses(start_date: str, end_date: str) -> dict[str, Any]:
+def list_expenses(api_key: str, start_date: str, end_date: str) -> dict[str, Any]:
     """List personal expenses in an inclusive date range (YYYY-MM-DD)."""
     try:
+        client = _get_client(api_key)
         res = (
-            get_user_client().table("transactions")
+            client.table("transactions")
             .select("id,expense_date,amount,category,subcategory,note,created_at,status")
             .is_("group_id", None)
             .gte("expense_date", start_date)
@@ -343,17 +294,23 @@ def list_expenses(start_date: str, end_date: str) -> dict[str, Any]:
             .order("expense_date", desc=True)
             .execute()
         )
-        return _with_pending_hint([_jsonable_row(dict(r)) for r in (res.data or [])])
+        return _with_pending_hint([_jsonable_row(dict(r)) for r in (res.data or [])], client)
     except Exception as e:
-        return _with_pending_hint(_err(f"Error listing expenses: {e!s}"))
+        return {"result": _err(f"Error listing expenses: {e!s}")}
 
 
 @mcp.tool()
-def summarize(start_date: str, end_date: str, category: str | None = None) -> dict[str, Any]:
+def summarize(
+    api_key: str,
+    start_date: str,
+    end_date: str,
+    category: str | None = None,
+) -> dict[str, Any]:
     """Personal spending totals by category for a date range."""
     try:
+        client = _get_client(api_key)
         q = (
-            get_user_client().table("transactions")
+            client.table("transactions")
             .select("category,amount")
             .is_("group_id", None)
             .gte("expense_date", start_date)
@@ -373,9 +330,9 @@ def summarize(start_date: str, end_date: str, category: str | None = None) -> di
             {"category": c, "total_amount": round(v["total_amount"], 2), "count": v["count"]}
             for c, v in sorted(buckets.items(), key=lambda x: -x[1]["total_amount"])
         ]
-        return _with_pending_hint(out)
+        return _with_pending_hint(out, client)
     except Exception as e:
-        return _with_pending_hint(_err(f"Error summarizing expenses: {e!s}"))
+        return {"result": _err(f"Error summarizing: {e!s}")}
 
 
 # ---------------------------------------------------------------------------
@@ -383,72 +340,81 @@ def summarize(start_date: str, end_date: str, category: str | None = None) -> di
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def create_group(name: str, kind: str = "trip") -> dict[str, Any]:
+def create_group(api_key: str, name: str, kind: str = "trip") -> dict[str, Any]:
     """Create a group and add caller as owner. kind: trip | family | team | personal_mirror."""
     try:
-        res = get_user_client().rpc("fn_create_group", {"p_name": name, "p_kind": kind}).execute()
+        client = _get_client(api_key)
+        res = client.rpc("fn_create_group", {"p_name": name, "p_kind": kind}).execute()
         gid = getattr(res, "data", None)
-        return _with_pending_hint({"status": "success", "group_id": str(gid) if gid else None})
+        return _with_pending_hint({"status": "success", "group_id": str(gid) if gid else None}, client)
     except Exception as e:
-        return _with_pending_hint(_err(f"fn_create_group: {e!s}"))
+        return {"result": _err(f"fn_create_group: {e!s}")}
 
 
 @mcp.tool()
-def list_my_groups() -> dict[str, Any]:
+def list_my_groups(api_key: str) -> dict[str, Any]:
     """List all groups the signed-in user belongs to."""
     try:
-        uid = jwt_subject(require_access_token())
-        client = get_user_client()
+        client = _get_client(api_key)
+        uid = jwt_subject(get_jwt_from_client(client))
         gm = client.table("group_members").select("group_id,role").eq("user_id", uid).execute()
         gids = [str(r["group_id"]) for r in (gm.data or [])]
         if not gids:
-            return _with_pending_hint([])
-        gr = client.table("groups").select("id,name,kind,created_at,settings").in_("id", gids).execute()
-        return _with_pending_hint([_jsonable_row(dict(r)) for r in (gr.data or [])])
+            return _with_pending_hint([], client)
+        gr = (
+            client.table("groups")
+            .select("id,name,kind,created_at,settings")
+            .in_("id", gids)
+            .execute()
+        )
+        return _with_pending_hint([_jsonable_row(dict(r)) for r in (gr.data or [])], client)
     except Exception as e:
-        return _with_pending_hint(_err(f"list_my_groups: {e!s}"))
+        return {"result": _err(f"list_my_groups: {e!s}")}
 
 
 @mcp.tool()
-def create_group_invite(group_id: str, expires_in_days: int = 7) -> dict[str, Any]:
+def create_group_invite(api_key: str, group_id: str, expires_in_days: int = 7) -> dict[str, Any]:
     """Generate an invite code for a group (share it out-of-band with the new member)."""
     try:
-        res = get_user_client().rpc(
+        client = _get_client(api_key)
+        res = client.rpc(
             "fn_create_group_invite",
             {"p_group_id": group_id, "p_expires_in_days": expires_in_days},
         ).execute()
-        return _with_pending_hint({"status": "success", "invite_code": getattr(res, "data", None)})
+        return _with_pending_hint({"status": "success", "invite_code": getattr(res, "data", None)}, client)
     except Exception as e:
-        return _with_pending_hint(_err(f"fn_create_group_invite: {e!s}"))
+        return {"result": _err(f"fn_create_group_invite: {e!s}")}
 
 
 @mcp.tool()
-def redeem_group_invite(invite_code: str) -> dict[str, Any]:
+def redeem_group_invite(api_key: str, invite_code: str) -> dict[str, Any]:
     """Join a group using an invite code."""
     try:
-        res = get_user_client().rpc(
+        client = _get_client(api_key)
+        res = client.rpc(
             "fn_redeem_group_invite",
             {"p_code": invite_code.strip().lower()},
         ).execute()
         gid = getattr(res, "data", None)
-        return _with_pending_hint({"status": "success", "group_id": str(gid) if gid else None})
+        return _with_pending_hint({"status": "success", "group_id": str(gid) if gid else None}, client)
     except Exception as e:
-        return _with_pending_hint(_err(f"redeem: {e!s}"))
+        return {"result": _err(f"redeem_group_invite: {e!s}")}
 
 
 @mcp.tool()
-def list_group_members(group_id: str) -> dict[str, Any]:
+def list_group_members(api_key: str, group_id: str) -> dict[str, Any]:
     """List members of a group with their roles."""
     try:
+        client = _get_client(api_key)
         res = (
-            get_user_client().table("group_members")
+            client.table("group_members")
             .select("user_id,role,joined_at")
             .eq("group_id", group_id)
             .execute()
         )
-        return _with_pending_hint([_jsonable_row(dict(r)) for r in (res.data or [])])
+        return _with_pending_hint([_jsonable_row(dict(r)) for r in (res.data or [])], client)
     except Exception as e:
-        return _with_pending_hint(_err(f"list_group_members: {e!s}"))
+        return {"result": _err(f"list_group_members: {e!s}")}
 
 
 # ---------------------------------------------------------------------------
@@ -457,6 +423,7 @@ def list_group_members(group_id: str) -> dict[str, Any]:
 
 @mcp.tool()
 def add_group_expense(
+    api_key: str,
     group_id: str,
     expense_date: str,
     amount: float,
@@ -471,7 +438,8 @@ def add_group_expense(
     payer_user_id defaults to the caller (the person who paid the bill).
     """
     try:
-        args: dict[str, Any] = {
+        client = _get_client(api_key)
+        res = client.rpc("fn_add_group_expense", {
             "p_group_id": group_id,
             "p_expense_date": expense_date,
             "p_amount": amount,
@@ -479,84 +447,92 @@ def add_group_expense(
             "p_subcategory": subcategory or "",
             "p_note": note or "",
             "p_payer_id": payer_user_id or None,
-        }
-        res = get_user_client().rpc("fn_add_group_expense", args).execute()
+        }).execute()
         tid = getattr(res, "data", None)
-        return _with_pending_hint({"status": "success", "transaction_id": str(tid) if tid else None})
+        return _with_pending_hint(
+            {"status": "success", "transaction_id": str(tid) if tid else None}, client
+        )
     except Exception as e:
-        return _with_pending_hint(_err(f"fn_add_group_expense: {e!s}"))
+        return {"result": _err(f"fn_add_group_expense: {e!s}")}
 
 
 @mcp.tool()
-def vote_on_transaction(transaction_id: str, vote: str) -> dict[str, Any]:
-    """Vote approve or reject on a pending group expense. You cannot vote on your own submission."""
+def vote_on_transaction(api_key: str, transaction_id: str, vote: str) -> dict[str, Any]:
+    """Vote approve or reject on a pending group expense. Cannot vote on your own submission."""
     try:
-        res = get_user_client().rpc(
+        client = _get_client(api_key)
+        res = client.rpc(
             "fn_vote_on_transaction",
             {"p_transaction_id": transaction_id, "p_vote": vote.strip().lower()},
         ).execute()
-        return _with_pending_hint({"status": "success", "vote_result": getattr(res, "data", None)})
+        return _with_pending_hint({"status": "success", "vote_result": getattr(res, "data", None)}, client)
     except Exception as e:
-        return _with_pending_hint(_err(f"vote: {e!s}"))
+        return {"result": _err(f"vote: {e!s}")}
 
 
 @mcp.tool()
-def approve_group_expense(transaction_id: str) -> dict[str, Any]:
+def approve_group_expense(api_key: str, transaction_id: str) -> dict[str, Any]:
     """Approve a pending group expense."""
-    return vote_on_transaction(transaction_id, "approve")
+    return vote_on_transaction(api_key, transaction_id, "approve")
 
 
 @mcp.tool()
-def reject_group_expense(transaction_id: str) -> dict[str, Any]:
+def reject_group_expense(api_key: str, transaction_id: str) -> dict[str, Any]:
     """Reject a pending group expense (finalises as rejected immediately)."""
-    return vote_on_transaction(transaction_id, "reject")
+    return vote_on_transaction(api_key, transaction_id, "reject")
 
 
 @mcp.tool()
-def list_pending_group_expenses(group_id: str) -> dict[str, Any]:
+def list_pending_group_expenses(api_key: str, group_id: str) -> dict[str, Any]:
     """List all pending expenses for a group."""
     try:
+        client = _get_client(api_key)
         res = (
-            get_user_client().table("transactions")
+            client.table("transactions")
             .select("id,submitted_by,payer_id,expense_date,amount,category,subcategory,note,status")
             .eq("group_id", group_id)
             .eq("status", "pending")
             .order("expense_date", desc=True)
             .execute()
         )
-        return _with_pending_hint([_jsonable_row(dict(r)) for r in (res.data or [])])
+        return _with_pending_hint([_jsonable_row(dict(r)) for r in (res.data or [])], client)
     except Exception as e:
-        return _with_pending_hint(_err(f"pending list: {e!s}"))
+        return {"result": _err(f"list_pending_group_expenses: {e!s}")}
 
 
 @mcp.tool()
-def list_my_pending_approvals() -> dict[str, Any]:
-    """List all group expenses waiting for your approval (excludes ones you already approved)."""
+def list_my_pending_approvals(api_key: str) -> dict[str, Any]:
+    """List all group expenses waiting for your approval."""
     try:
-        uid = jwt_subject(require_access_token())
-        res = get_user_client().rpc("fn_get_pending_count", {"p_user_id": uid}).execute()
+        client = _get_client(api_key)
+        uid = jwt_subject(get_jwt_from_client(client))
+        res = client.rpc("fn_get_pending_count", {"p_user_id": uid}).execute()
         if res.data:
             row = res.data[0]
-            return _with_pending_hint({
-                "count": row.get("count", 0),
-                "items": row.get("sample") or [],
-            })
-        return _with_pending_hint({"count": 0, "items": []})
+            return _with_pending_hint(
+                {"count": row.get("count", 0), "items": row.get("sample") or []}, client
+            )
+        return _with_pending_hint({"count": 0, "items": []}, client)
     except Exception as e:
-        return _with_pending_hint(_err(f"pending approvals: {e!s}"))
+        return {"result": _err(f"list_my_pending_approvals: {e!s}")}
 
 
 @mcp.tool()
 def list_group_transactions(
+    api_key: str,
     group_id: str,
     start_date: str | None = None,
     end_date: str | None = None,
 ) -> dict[str, Any]:
     """List all transactions for a group, optionally filtered by date range."""
     try:
+        client = _get_client(api_key)
         q = (
-            get_user_client().table("transactions")
-            .select("id,submitted_by,payer_id,expense_date,amount,category,subcategory,note,status,created_at")
+            client.table("transactions")
+            .select(
+                "id,submitted_by,payer_id,expense_date,amount,"
+                "category,subcategory,note,status,created_at"
+            )
             .eq("group_id", group_id)
         )
         if start_date:
@@ -564,9 +540,9 @@ def list_group_transactions(
         if end_date:
             q = q.lte("expense_date", end_date)
         res = q.order("expense_date", desc=True).execute()
-        return _with_pending_hint([_jsonable_row(dict(r)) for r in (res.data or [])])
+        return _with_pending_hint([_jsonable_row(dict(r)) for r in (res.data or [])], client)
     except Exception as e:
-        return _with_pending_hint(_err(f"list_group_transactions: {e!s}"))
+        return {"result": _err(f"list_group_transactions: {e!s}")}
 
 
 # ---------------------------------------------------------------------------
@@ -574,15 +550,17 @@ def list_group_transactions(
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def group_balances(group_id: str, include_settlements: bool = True) -> dict[str, Any]:
+def group_balances(api_key: str, group_id: str, include_settlements: bool = True) -> dict[str, Any]:
     """
-    Per-member net balance in INR (positive = others owe them, negative = they owe others).
-    Set include_settlements=False to see balances from expenses only.
+    Per-member net balance in INR.
+    Positive = others owe them. Negative = they owe others.
     """
     try:
-        client = get_user_client()
+        client = _get_client(api_key)
         if include_settlements:
-            res = client.rpc("fn_group_balances_with_settlements", {"p_group_id": group_id}).execute()
+            res = client.rpc(
+                "fn_group_balances_with_settlements", {"p_group_id": group_id}
+            ).execute()
             net = {str(r["user_id"]): float(r["net_balance"]) for r in (res.data or [])}
         else:
             res = (
@@ -593,21 +571,20 @@ def group_balances(group_id: str, include_settlements: bool = True) -> dict[str,
                 .execute()
             )
             net = accumulate_group_balances(res.data or [])
-        return _with_pending_hint({"group_id": group_id, "net_by_user_id": net})
+        return _with_pending_hint({"group_id": group_id, "net_by_user_id": net}, client)
     except Exception as e:
-        return _with_pending_hint(_err(f"group_balances: {e!s}"))
+        return {"result": _err(f"group_balances: {e!s}")}
 
 
 @mcp.tool()
-def simplify_group_debts(group_id: str, include_settlements: bool = True) -> dict[str, Any]:
-    """
-    Suggest the minimum set of transfers (in INR) to fully settle the group.
-    Set include_settlements=False to ignore already-recorded payments.
-    """
+def simplify_group_debts(api_key: str, group_id: str, include_settlements: bool = True) -> dict[str, Any]:
+    """Suggest the minimum set of transfers (in INR) to fully settle the group."""
     try:
-        client = get_user_client()
+        client = _get_client(api_key)
         if include_settlements:
-            res = client.rpc("fn_group_balances_with_settlements", {"p_group_id": group_id}).execute()
+            res = client.rpc(
+                "fn_group_balances_with_settlements", {"p_group_id": group_id}
+            ).execute()
             net = {str(r["user_id"]): float(r["net_balance"]) for r in (res.data or [])}
         else:
             res = (
@@ -622,13 +599,14 @@ def simplify_group_debts(group_id: str, include_settlements: bool = True) -> dic
             "group_id": group_id,
             "net_by_user_id": net,
             "suggested_transfers": simplify_debts(net),
-        })
+        }, client)
     except Exception as e:
-        return _with_pending_hint(_err(f"simplify_group_debts: {e!s}"))
+        return {"result": _err(f"simplify_group_debts: {e!s}")}
 
 
 @mcp.tool()
 def record_settlement(
+    api_key: str,
     group_id: str,
     from_user_id: str,
     to_user_id: str,
@@ -647,6 +625,7 @@ def record_settlement(
         note: e.g. "PhonePe", "GPay", "Cash".
     """
     try:
+        client = _get_client(api_key)
         args: dict[str, Any] = {
             "p_group_id": group_id,
             "p_from_user_id": from_user_id,
@@ -656,27 +635,29 @@ def record_settlement(
         }
         if payment_date:
             args["p_payment_date"] = payment_date
-        res = get_user_client().rpc("fn_record_settlement", args).execute()
+        res = client.rpc("fn_record_settlement", args).execute()
         sid = getattr(res, "data", None)
         return _with_pending_hint({
             "status": "success",
             "settlement_id": str(sid) if sid else None,
             "message": f"Recorded: {from_user_id} → {to_user_id} ₹{amount}",
-        })
+        }, client)
     except Exception as e:
-        return _with_pending_hint(_err(f"record_settlement: {e!s}"))
+        return {"result": _err(f"record_settlement: {e!s}")}
 
 
 @mcp.tool()
 def list_group_settlements(
+    api_key: str,
     group_id: str,
     start_date: str | None = None,
     end_date: str | None = None,
 ) -> dict[str, Any]:
     """List recorded settlement payments for a group."""
     try:
+        client = _get_client(api_key)
         q = (
-            get_user_client().table("settlement_payments")
+            client.table("settlement_payments")
             .select("id,from_user_id,to_user_id,amount,payment_date,note,recorded_by,created_at")
             .eq("group_id", group_id)
         )
@@ -685,9 +666,9 @@ def list_group_settlements(
         if end_date:
             q = q.lte("payment_date", end_date)
         res = q.order("payment_date", desc=True).execute()
-        return _with_pending_hint([_jsonable_row(dict(r)) for r in (res.data or [])])
+        return _with_pending_hint([_jsonable_row(dict(r)) for r in (res.data or [])], client)
     except Exception as e:
-        return _with_pending_hint(_err(f"list_group_settlements: {e!s}"))
+        return {"result": _err(f"list_group_settlements: {e!s}")}
 
 
 # ---------------------------------------------------------------------------
