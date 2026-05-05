@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 
 from supabase import Client, create_client
 
@@ -15,14 +16,21 @@ def _url_and_key() -> tuple[str, str]:
     return url, key
 
 
+@dataclass
+class AuthedClient:
+    """Authenticated Supabase client bundled with the JWT so we never need to re-extract it."""
+    client: Client
+    access_token: str
+
+
 def get_anon_client() -> Client:
     """Unauthenticated Supabase client (registration / login only)."""
     url, key = _url_and_key()
     return create_client(url, key)
 
 
-def get_client_for_api_key(api_key: str) -> Client:
-    """Validate API key, exchange refresh token for a fresh JWT, return authenticated client.
+def get_client_for_api_key(api_key: str) -> AuthedClient:
+    """Validate API key, exchange refresh token for a fresh JWT, return AuthedClient.
 
     Called on every tool invocation — stateless, restart-safe.
     """
@@ -58,19 +66,19 @@ def get_client_for_api_key(api_key: str) -> Client:
     new_refresh = session_res.session.refresh_token
 
     # Build authenticated client
-    authed = create_client(url, key)
-    authed.postgrest.auth(access_token)
+    authed_client = create_client(url, key)
+    authed_client.postgrest.auth(access_token)
 
-    # Persist the rotated refresh token via RPC (bypasses RLS update restriction)
-    authed.rpc("fn_update_api_key_refresh_token", {
+    # Persist the rotated refresh token via security-definer RPC
+    authed_client.rpc("fn_update_api_key_refresh_token", {
         "p_api_key": api_key,
         "p_refresh_token": new_refresh,
     }).execute()
 
-    return authed
+    return AuthedClient(client=authed_client, access_token=access_token)
 
 
-def get_client_for_env_token() -> Client:
+def get_client_for_env_token() -> AuthedClient:
     """Authenticated client using SUPABASE_ACCESS_TOKEN env var (local dev only)."""
     url, key = _url_and_key()
     token = os.environ.get("SUPABASE_ACCESS_TOKEN", "").strip()
@@ -82,10 +90,4 @@ def get_client_for_env_token() -> Client:
         )
     client = create_client(url, key)
     client.postgrest.auth(token)
-    return client
-
-
-def get_jwt_from_client(client: Client) -> str:
-    """Extract the JWT from an authenticated client's postgrest session."""
-    auth_header = client.postgrest.session.headers.get("Authorization", "")
-    return auth_header.replace("Bearer ", "").strip()
+    return AuthedClient(client=client, access_token=token)
