@@ -33,12 +33,14 @@ def get_client_for_api_key(api_key: str) -> AuthedClient:
     """Validate API key, exchange refresh token for a fresh JWT, return AuthedClient.
 
     Called on every tool invocation — stateless, restart-safe.
+    Uses fn_validate_and_lock_api_key to prevent refresh token race conditions.
     """
     url, key = _url_and_key()
     anon = create_client(url, key)
 
     # Validate key and retrieve stored refresh token
-    res = anon.rpc("fn_validate_api_key", {"p_api_key": api_key}).execute()
+    # Uses SELECT FOR UPDATE internally to prevent concurrent token exchange races
+    res = anon.rpc("fn_validate_and_lock_api_key", {"p_api_key": api_key}).execute()
     data = res.data
     if isinstance(data, list):
         data = data[0] if data else {}
