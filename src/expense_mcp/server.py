@@ -211,26 +211,26 @@ def login_get_api_key(email: str, password: str) -> dict[str, Any]:
         return _err(f"Login failed: {e!s}")
 
 
-@mcp.tool()
-def whoami(api_key: str = "") -> dict[str, Any]:
-    """Return the current user's id. Confirms authentication is working."""
-    try:
-        ac = _get_ac(api_key)
-        return {"status": "success", "user_id": jwt_subject(ac.access_token)}
-    except Exception as e:
-        return _err(str(e))
+# @mcp.tool()
+# def whoami(api_key: str = "") -> dict[str, Any]:
+#     """Return the current user's id. Confirms authentication is working."""
+#     try:
+#         ac = _get_ac(api_key)
+#         return {"status": "success", "user_id": jwt_subject(ac.access_token)}
+#     except Exception as e:
+#         return _err(str(e))
 
 
-@mcp.tool()
-def revoke_my_api_key(api_key: str) -> dict[str, Any]:
-    """🚫 Revoke a compromised API key. Call login_get_api_key() afterwards to get a new one."""
-    try:
-        ac = _get_ac(api_key)
-        res = ac.client.rpc("fn_revoke_api_key", {"p_api_key": api_key}).execute()
-        data = getattr(res, "data", {})
-        return data if isinstance(data, dict) else _err("Unexpected response")
-    except Exception as e:
-        return _err(f"Revoke failed: {e!s}")
+# @mcp.tool()
+# def revoke_my_api_key(api_key: str) -> dict[str, Any]:
+#     """🚫 Revoke a compromised API key. Call login_get_api_key() afterwards to get a new one."""
+#     try:
+#         ac = _get_ac(api_key)
+#         res = ac.client.rpc("fn_revoke_api_key", {"p_api_key": api_key}).execute()
+#         data = getattr(res, "data", {})
+#         return data if isinstance(data, dict) else _err("Unexpected response")
+#     except Exception as e:
+#         return _err(f"Revoke failed: {e!s}")
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +325,226 @@ def summarize(
         return _with_pending_hint(out, ac)
     except Exception as e:
         return {"result": _err(f"Error summarizing: {e!s}")}
+
+
+@mcp.tool()
+def delete_expense(api_key: str, expense_id: str) -> dict[str, Any]:
+    """Delete a personal expense by its ID. Only works on your own expenses."""
+    try:
+        ac = _get_ac(api_key)
+        uid = jwt_subject(ac.access_token)
+        # Verify it exists and belongs to the user before deleting
+        check = (
+            ac.client.table("transactions")
+            .select("id")
+            .eq("id", expense_id)
+            .eq("submitted_by", uid)
+            .is_("group_id", None)
+            .execute()
+        )
+        if not check.data:
+            return _err("Expense not found or you don't have permission to delete it.")
+        ac.client.table("transactions").delete().eq("id", expense_id).execute()
+        return _with_pending_hint({
+            "status": "success",
+            "message": f"Expense {expense_id} deleted.",
+        }, ac)
+    except Exception as e:
+        return {"result": _err(f"Delete failed: {e!s}")}
+
+
+@mcp.tool()
+def edit_expense(
+    api_key: str,
+    expense_id: str,
+    date: str | None = None,
+    amount: float | None = None,
+    category: str | None = None,
+    subcategory: str | None = None,
+    note: str | None = None,
+) -> dict[str, Any]:
+    """
+    Edit a personal expense. Only pass the fields you want to change.
+
+    Args:
+        expense_id: ID of the expense to edit (from list_expenses).
+        date: New date (YYYY-MM-DD), optional.
+        amount: New amount in INR, optional.
+        category: New category, optional.
+        subcategory: New subcategory, optional.
+        note: New note, optional.
+    """
+    try:
+        ac = _get_ac(api_key)
+        uid = jwt_subject(ac.access_token)
+
+        # Verify ownership
+        check = (
+            ac.client.table("transactions")
+            .select("id,expense_date,amount,category,subcategory,note")
+            .eq("id", expense_id)
+            .eq("submitted_by", uid)
+            .is_("group_id", None)
+            .execute()
+        )
+        if not check.data:
+            return _err("Expense not found or you don't have permission to edit it.")
+
+        # Build update payload with only provided fields
+        updates: dict[str, Any] = {}
+        if date is not None:
+            updates["expense_date"] = date
+        if amount is not None:
+            updates["amount"] = amount
+        if category is not None:
+            updates["category"] = category
+        if subcategory is not None:
+            updates["subcategory"] = subcategory
+        if note is not None:
+            updates["note"] = note
+
+        if not updates:
+            return _err("No fields provided to update.")
+
+        res = (
+            ac.client.table("transactions")
+            .update(updates)
+            .eq("id", expense_id)
+            .execute()
+        )
+        if not res.data:
+            return _err("Update failed — no rows affected.")
+
+        return _with_pending_hint({
+            "status": "success",
+            "message": "Expense updated successfully.",
+            "updated": _jsonable_row(dict(res.data[0])),
+        }, ac)
+    except Exception as e:
+        return {"result": _err(f"Edit failed: {e!s}")}
+
+
+@mcp.tool()
+def monthly_report(api_key: str, month: int, year: int) -> dict[str, Any]:
+    """
+    Full spending report for a given month.
+
+    Returns total spent, category breakdown, biggest single expense,
+    daily totals, busiest spending day, and week-wise pattern.
+
+    Args:
+        month: Month number (1-12).
+        year: Four-digit year e.g. 2026.
+    """
+    try:
+        import calendar
+        ac = _get_ac(api_key)
+
+        # Build date range for the month
+        last_day = calendar.monthrange(year, month)[1]
+        start = f"{year}-{month:02d}-01"
+        end = f"{year}-{month:02d}-{last_day:02d}"
+
+        rows = (
+            ac.client.table("transactions")
+            .select("id,expense_date,amount,category,subcategory,note")
+            .is_("group_id", None)
+            .gte("expense_date", start)
+            .lte("expense_date", end)
+            .order("expense_date", desc=False)
+            .execute()
+        ).data or []
+
+        if not rows:
+            return _with_pending_hint({
+                "month": f"{calendar.month_name[month]} {year}",
+                "message": "No expenses recorded this month.",
+                "total_spent": 0,
+            }, ac)
+
+        total = 0.0
+        category_buckets: dict[str, float] = {}
+        daily_totals: dict[str, float] = {}
+        biggest = {"amount": 0.0, "category": "", "note": "", "date": ""}
+        weekday_totals: dict[str, float] = {
+            "Monday": 0.0, "Tuesday": 0.0, "Wednesday": 0.0,
+            "Thursday": 0.0, "Friday": 0.0, "Saturday": 0.0, "Sunday": 0.0,
+        }
+
+        for r in rows:
+            amt = float(r.get("amount") or 0)
+            cat = r.get("category") or "Other"
+            date_str = str(r.get("expense_date", ""))
+            note = r.get("note") or ""
+
+            total += amt
+
+            # Category breakdown
+            category_buckets[cat] = category_buckets.get(cat, 0.0) + amt
+
+            # Daily totals
+            daily_totals[date_str] = daily_totals.get(date_str, 0.0) + amt
+
+            # Biggest single expense
+            if amt > biggest["amount"]:
+                biggest = {"amount": amt, "category": cat, "note": note, "date": date_str}
+
+            # Weekday pattern
+            try:
+                from datetime import date as dt_date
+                y, m, d = map(int, date_str.split("-"))
+                weekday = dt_date(y, m, d).strftime("%A")
+                weekday_totals[weekday] = weekday_totals.get(weekday, 0.0) + amt
+            except Exception:
+                pass
+
+        # Top categories sorted by spend
+        top_categories = [
+            {
+                "category": cat,
+                "total": round(amt, 2),
+                "percentage": round(amt / total * 100, 1),
+            }
+            for cat, amt in sorted(category_buckets.items(), key=lambda x: -x[1])
+        ]
+
+        # Busiest day
+        busiest_day = max(daily_totals, key=lambda d: daily_totals[d]) if daily_totals else None
+
+        # Weekend vs weekday split
+        weekend = round(weekday_totals["Saturday"] + weekday_totals["Sunday"], 2)
+        weekday = round(total - weekend, 2)
+
+        # Daily totals list (for day-wise trend)
+        daily_list = [
+            {"date": d, "total": round(v, 2)}
+            for d, v in sorted(daily_totals.items())
+        ]
+
+        return _with_pending_hint({
+            "month": f"{calendar.month_name[month]} {year}",
+            "total_spent": round(total, 2),
+            "transaction_count": len(rows),
+            "top_categories": top_categories,
+            "biggest_expense": {
+                "amount": round(biggest["amount"], 2),
+                "category": biggest["category"],
+                "note": biggest["note"],
+                "date": biggest["date"],
+            },
+            "busiest_day": {
+                "date": busiest_day,
+                "total": round(daily_totals.get(busiest_day, 0), 2) if busiest_day else 0,
+            },
+            "weekday_vs_weekend": {
+                "weekdays_total": weekday,
+                "weekends_total": weekend,
+                "weekend_percentage": round(weekend / total * 100, 1) if total else 0,
+            },
+            "daily_totals": daily_list,
+        }, ac)
+    except Exception as e:
+        return {"result": _err(f"monthly_report: {e!s}")}
 
 
 # ---------------------------------------------------------------------------
@@ -448,7 +668,6 @@ def add_group_expense(
         return {"result": _err(f"fn_add_group_expense: {e!s}")}
 
 
-@mcp.tool()
 def vote_on_transaction(api_key: str, transaction_id: str, vote: str) -> dict[str, Any]:
     """Vote approve or reject on a pending group expense. Cannot vote on your own submission."""
     try:
@@ -535,6 +754,95 @@ def list_group_transactions(
         return _with_pending_hint([_jsonable_row(dict(r)) for r in (res.data or [])], ac)
     except Exception as e:
         return {"result": _err(f"list_group_transactions: {e!s}")}
+
+
+@mcp.tool()
+def delete_group_expense(api_key: str, transaction_id: str) -> dict[str, Any]:
+    """
+    Delete a pending group expense. Only the person who submitted it can delete it,
+    and only while it is still pending (not yet approved or rejected).
+    """
+    try:
+        ac = _get_ac(api_key)
+        res = ac.client.rpc(
+            "fn_delete_group_expense", {"p_transaction_id": transaction_id}
+        ).execute()
+        data = getattr(res, "data", {})
+        return _with_pending_hint(data if isinstance(data, dict) else _err("Unexpected response"), ac)
+    except Exception as e:
+        return {"result": _err(f"delete_group_expense: {e!s}")}
+
+
+@mcp.tool()
+def group_summary(
+    api_key: str,
+    group_id: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    """
+    Spending breakdown for a group by category (approved expenses only).
+    Optionally filter by date range. Great for trip/event summaries.
+
+    Example: "What did we spend on food during the Goa trip?"
+    """
+    try:
+        ac = _get_ac(api_key)
+        q = (
+            ac.client.table("transactions")
+            .select("category,amount,payer_id,expense_date")
+            .eq("group_id", group_id)
+            .eq("status", "approved")
+        )
+        if start_date:
+            q = q.gte("expense_date", start_date)
+        if end_date:
+            q = q.lte("expense_date", end_date)
+        rows = q.execute().data or []
+
+        buckets: dict[str, dict[str, Any]] = {}
+        total = 0.0
+        for r in rows:
+            c = r.get("category") or "Other"
+            amt = float(r.get("amount") or 0)
+            buckets.setdefault(c, {"total_amount": 0.0, "count": 0})
+            buckets[c]["total_amount"] += amt
+            buckets[c]["count"] += 1
+            total += amt
+
+        breakdown = [
+            {
+                "category": c,
+                "total_amount": round(v["total_amount"], 2),
+                "count": v["count"],
+                "percentage": round(v["total_amount"] / total * 100, 1) if total else 0,
+            }
+            for c, v in sorted(buckets.items(), key=lambda x: -x[1]["total_amount"])
+        ]
+
+        return _with_pending_hint({
+            "group_id": group_id,
+            "total_spent": round(total, 2),
+            "transaction_count": len(rows),
+            "breakdown_by_category": breakdown,
+        }, ac)
+    except Exception as e:
+        return {"result": _err(f"group_summary: {e!s}")}
+
+
+@mcp.tool()
+def leave_group(api_key: str, group_id: str) -> dict[str, Any]:
+    """
+    Leave a group. You will lose access to all group data after leaving.
+    Note: Group owners cannot leave — transfer ownership or delete the group first.
+    """
+    try:
+        ac = _get_ac(api_key)
+        res = ac.client.rpc("fn_leave_group", {"p_group_id": group_id}).execute()
+        data = getattr(res, "data", {})
+        return data if isinstance(data, dict) else _err("Unexpected response")
+    except Exception as e:
+        return {"result": _err(f"leave_group: {e!s}")}
 
 
 # ---------------------------------------------------------------------------
